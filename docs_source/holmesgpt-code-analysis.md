@@ -1,4 +1,4 @@
-# HolmesGPT 代码架构分析文档
+﻿# HolmesGPT 代码架构分析文档
 
 > 本文档面向刚接手 HolmesGPT 项目的开发人员，系统性地说明 `holmes/`（核心引擎）和 `holmes_operator/`（Kubernetes Operator）两个代码库的架构设计、模块职责和关键流程。
 
@@ -13,27 +13,31 @@
 3. [系统架构图](#3-系统架构图)
 4. [系统流程图](#4-系统流程图)
    - Operator 侧流程
-5. [holmes/ — 核心引擎架构](#5-holmes--核心引擎架构)
-   - 5.1 顶层入口与 CLI
-   - 5.2 配置系统
-   - 5.3 LLM 调用引擎（Agentic Loop）
-   - 5.4 工具集系统
-   - 5.5 提示词系统
-   - 5.6 插件体系
-   - 5.7 检查系统（Checks API）
-   - 5.8 服务端（FastAPI）
-   - 5.9 其他子系统
-6. [holmes_operator/ — K8s Operator 架构](#6-holmes_operator--kubernetes-operator-架构)
-   - 6.1 CRD 数据模型
-   - 6.2 Operator 入口与生命周期
-   - 6.3 全局上下文
-   - 6.4 事件处理器
-   - 6.5 调度器
-   - 6.6 API 客户端
-   - 6.7 工具函数
-   - 6.8 配置
-7. [两者关系与通信](#7-两者关系与通信)
-8. [开发指南](#8-开发指南)
+5. [核心业务时序图](#5-核心业务时序图)
+   - 5.1 holmes ask 提问流程
+   - 5.2 告警调查流程
+   - 5.3 健康检查执行时序
+6. [holmes/ — 核心引擎架构](#6-holmes--核心引擎架构)
+   - 6.1 顶层入口与 CLI
+   - 6.2 配置系统
+   - 6.3 LLM 调用引擎（Agentic Loop）
+   - 6.4 工具集系统
+   - 6.5 提示词系统
+   - 6.6 插件体系
+   - 6.7 检查系统（Checks API）
+   - 6.8 服务端（FastAPI）
+   - 6.9 其他子系统
+7. [holmes_operator/ — K8s Operator 架构](#7-holmes_operator--kubernetes-operator-架构)
+   - 7.1 CRD 数据模型
+   - 7.2 Operator 入口与生命周期
+   - 7.3 全局上下文
+   - 7.4 事件处理器
+   - 7.5 调度器
+   - 7.6 API 客户端
+   - 7.7 工具函数
+   - 7.8 配置
+8. [两者关系与通信](#8-两者关系与通信)
+9. [开发指南](#9-开发指南)
 
 ---
 
@@ -308,9 +312,189 @@ flowchart LR
 
 ---
 
-## 5. holmes/ — 核心引擎架构
+## 5. 核心业务时序图
 
-### 5.1 顶层入口与 CLI
+### 5.1 `holmes ask` 提问流程
+
+用户通过 CLI 提问时，系统从取配置到 LLM 多步推理的完整时序：
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant CLI as holmes/main.py
+    participant Config as Config
+    participant TSM as ToolsetManager
+    participant LLM_Engine as ToolCallingLLM
+    participant ToolExec as ToolExecutor
+    participant Provider as LLM Provider
+    participant ToolImpl as 工具实现
+
+    User->>CLI: holmes ask "检查集群异常 Pod"
+    CLI->>Config: load_from_file(config_file, api_key, model...)
+    Config->>TSM: 加载 & 检查工具集
+    TSM-->>Config: toolsets[]
+    Config->>LLM_Engine: create_toolcalling_llm(toolsets, model)
+    CLI->>LLM_Engine: build_initial_ask_messages(prompt)
+    LLM_Engine-->>CLI: messages[] (system + user)
+
+    loop Agentic Loop (最多 max_steps 次)
+        CLI->>LLM_Engine: call_stream(messages)
+        LLM_Engine->>LLM_Engine: compact_if_necessary()  ← 接近上限时压缩
+        LLM_Engine->>Provider: LLM.completion(messages, tools)
+        Provider-->>LLM_Engine: response (含 tool_calls 或最终答案)
+
+        alt 没有 tool_calls
+            LLM_Engine-->>CLI: ANSWER_END (最终答案)
+        else 有 tool_calls
+            par 并行执行工具 (max_workers=16)
+                LLM_Engine->>ToolExec: get_tool_by_name("kubernetes/list_pods")
+                ToolExec->>ToolImpl: invoke(params)
+                ToolImpl-->>ToolExec: StructuredToolResult
+                ToolExec-->>LLM_Engine: ToolCallResult
+
+                LLM_Engine->>ToolExec: get_tool_by_name("kubernetes_logs/fetch_logs")
+                ToolExec->>ToolImpl: invoke(params)
+                ToolImpl-->>ToolExec: StructuredToolResult
+                ToolExec-->>LLM_Engine: ToolCallResult
+            end
+
+            alt 需要用户审批
+                LLM_Engine-->>CLI: APPROVAL_REQUIRED
+                CLI->>User: 交互式审批菜单
+                User-->>CLI: 批准/拒绝/编辑命令
+                CLI->>LLM_Engine: tool_decisions[]
+                LLM_Engine->>ToolExec: 用户批准后重新执行
+            end
+
+            LLM_Engine->>LLM_Engine: 追加工具结果到 messages
+        end
+    end
+
+    CLI->>CLI: handle_result() Rich 格式化输出
+    CLI-->>User: 完整诊断结论
+```
+
+### 5.2 `holmes investigate alertmanager` 告警调查流程
+
+连接 AlertManager 获取告警，逐一提交给 LLM 分析：
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant CLI as holmes/main.py
+    participant Config as Config
+    participant Source as AlertManagerSource
+    participant LLM_Engine as ToolCallingLLM
+    participant Provider as LLM Provider
+    participant Tools as 工具集
+
+    User->>CLI: holmes investigate alertmanager
+    CLI->>Config: load_from_file(alertmanager_url...)
+    Config->>Source: create_alertmanager_source()
+    CLI->>Source: fetch_issues()
+    Source->>Source: GET /api/v2/alerts
+    Source-->>CLI: List[Issue]
+
+    loop 每个告警
+        CLI->>CLI: _investigate_issue(ai, issue, config)
+        CLI->>LLM_Engine: build_system_prompt(toolsets, additions)
+        LLM_Engine-->>CLI: system_prompt
+        CLI->>LLM_Engine: build_user_prompt(issue.raw)
+        LLM_Engine-->>CLI: user_prompt
+        CLI->>LLM_Engine: call([system, user])
+
+        loop Agentic Loop
+            LLM_Engine->>Provider: LLM.completion(messages, tools)
+            Provider-->>LLM_Engine: response
+
+            alt 有 tool_calls
+                LLM_Engine->>Tools: 并行执行工具查询指标/日志/仪表盘
+                Tools-->>LLM_Engine: 查询结果
+            else 最终答案
+                LLM_Engine-->>CLI: LLMResult
+            end
+        end
+
+        CLI->>CLI: handle_result(destination, show_tool_output)
+        alt destination=slack
+            CLI->>Slack: send_issue(issue, result)
+        end
+        CLI-->>User: 告警根因分析
+    end
+```
+
+### 5.3 Operator → API → LLM 健康检查执行时序
+
+用户创建 HealthCheck CRD 到 Operator 执行完成的全链路时序：
+
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant K8s as Kubernetes API
+    participant Operator as Holmes Operator
+    participant Scheduler as APScheduler
+    participant ApiClient as HolmesAPIClient
+    participant ChecksAPI as FastAPI /checks
+    participant LLM_Engine as ToolCallingLLM
+    participant Provider as LLM Provider
+    participant Tools as 工具集
+    participant Slack as Slack
+
+    par 定时触发场景
+        Scheduler->>Operator: cron 触发 execute_scheduled_check()
+    and 一次性触发场景
+        User->>K8s: kubectl apply HealthCheck CR
+        K8s->>Operator: kopf 捕获 on.create 事件
+    end
+
+    Operator->>Operator: set_healthcheck_pending()
+    Operator->>K8s: PATCH status.phase=Pending
+
+    Operator->>Operator: HealthCheckSpec(**spec) 验证
+    Operator->>Operator: set_healthcheck_running()
+    Operator->>K8s: PATCH status.phase=Running
+
+    Operator->>ApiClient: execute_check(name, query, timeout, mode)
+    ApiClient->>ChecksAPI: POST /api/checks/execute
+    ChecksAPI->>ChecksAPI: Config.create_toolcalling_llm()
+    ChecksAPI->>LLM_Engine: execute_check(Check, ai)
+
+    loop Agentic Loop
+        LLM_Engine->>Provider: LLM.completion(messages, tools)
+        Provider-->>LLM_Engine: response
+
+        alt 有 tool_calls
+            LLM_Engine->>Tools: 并行执行工具查询
+            Tools-->>LLM_Engine: 查询结果
+        else 最终答案
+            LLM_Engine-->>ChecksAPI: CheckResult (PASS/FAIL/ERROR)
+        end
+    end
+
+    alt 检查失败 + ALERT 模式 + 配置了 Slack
+        ChecksAPI->>Slack: SlackDestination.send_issue(issue, llm_result)
+    end
+
+    ChecksAPI-->>ApiClient: CheckExecutionResponse
+    ApiClient-->>Operator: CheckResponse
+
+    Operator->>Operator: set_healthcheck_completed()
+    Operator->>K8s: PATCH status.phase=Completed, result, rationale, duration
+
+    alt 检查失败 + ALERT 模式
+        Operator->>K8s: 创建 Warning K8s Event
+    end
+
+    Operator-->>K8s: status 更新完成
+
+    par 定时任务额外步骤
+        Operator->>Scheduler: watch_healthcheck_completion() 轮询等待
+        Scheduler->>K8s: 将结果从 active[] 移至 history[]
+        Operator->>K8s: PATCH lastScheduleTime, lastResult, history
+    end
+```
+
+### 6.1 顶层入口与 CLI
 
 **入口文件：** `holmes/main.py`
 
@@ -355,7 +539,7 @@ CLI 参数 → Config.load_from_file() → 创建 ToolCallingLLM
 - 包含工具审批回调机制：当工具需要审批时，弹出交互式审批菜单
 - 启动时通过 `InitProgressRenderer` 显示初始化进度（加载模型、检查工具集）
 
-### 5.2 配置系统
+### 6.2 配置系统
 
 **核心文件：** `holmes/config.py`
 
@@ -391,7 +575,7 @@ CLI 参数 → Config.load_from_file() → 创建 ToolCallingLLM
 - 支持标签过滤（`ToolsetTag.CORE` / `CLI` / `CLUSTER`）来区分 CLI 和服务端模式
 - 前提检查（`check_toolset_prerequisites`）使用线程池并行执行，默认 20 秒超时
 
-### 5.3 LLM 调用引擎（Agentic Loop）
+### 6.3 LLM 调用引擎（Agentic Loop）
 
 **核心文件：** `holmes/core/tool_calling_llm.py`
 
@@ -437,7 +621,7 @@ messages → 检查是否需要压缩(compaction)
 - **OAuth**：支持 OAuth 认证码交换流程
 - **OTel 指标**：记录工具调用次数、耗时、LLM token 使用等
 
-### 5.4 工具集系统
+### 6.4 工具集系统
 
 **核心文件：** `holmes/core/tools.py`, `holmes/plugins/toolsets/__init__.py`
 
@@ -499,7 +683,7 @@ LLM 请求调用工具 → ToolExecutor.get_tool_by_name() 查找工具
 
 **工具结果状态：** `SUCCESS` / `ERROR` / `NO_DATA` / `APPROVAL_REQUIRED` / `FRONTEND_PAUSE`
 
-### 5.5 提示词系统
+### 6.5 提示词系统
 
 **核心文件：** `holmes/core/prompt.py`, `holmes/plugins/prompts/__init__.py`
 
@@ -540,7 +724,7 @@ LLM 请求调用工具 → ToolExecutor.get_tool_by_name() 查找工具
 | `_ticket_additions.jinja2` | 工单调查附加信息 |
 | `_investigation_additions.jinja2` | 调查附加信息 |
 
-### 5.6 插件体系
+### 6.6 插件体系
 
 **核心文件：** `holmes/plugins/interfaces.py`
 
@@ -567,7 +751,7 @@ class DestinationPlugin:
 
 **Issue 对象** (`holmes/core/issue.py`)：CLI 和插件之间的事件实体，包含 id、名称、原始数据、状态等字段。
 
-### 5.7 检查系统（Checks API）
+### 6.7 检查系统（Checks API）
 
 **核心文件：** `holmes/checks/`
 
@@ -601,7 +785,7 @@ CheckExecutionRequest → Config.create_toolcalling_llm()
 
 **CLI 接口** (`checks/checks_cli.py`)：`holmes checks apply/list/delete` 命令
 
-### 5.8 服务端（FastAPI）
+### 6.8 服务端（FastAPI）
 
 **核心文件：** `server.py`
 
@@ -618,7 +802,7 @@ FastAPI Web 服务器，提供以下功能：
 - CORS 中间件、认证中间件（API Key 验证）
 - Sentry 错误追踪
 
-### 5.9 其他子系统
+### 6.9 其他子系统
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
@@ -637,9 +821,9 @@ FastAPI Web 服务器，提供以下功能：
 
 ---
 
-## 6. holmes_operator/ — Kubernetes Operator 架构
+## 7. holmes_operator/ — Kubernetes Operator 架构
 
-### 6.1 CRD 数据模型
+### 7.1 CRD 数据模型
 
 **核心文件：** `holmes_operator/models.py`
 
@@ -694,7 +878,7 @@ status:
   conditions: [...]
 ```
 
-### 6.2 Operator 入口与生命周期
+### 7.2 Operator 入口与生命周期
 
 **核心文件：** `holmes_operator/operator.py`
 
@@ -710,7 +894,7 @@ status:
   → 停止调度器、关闭 API 客户端、释放资源
 ```
 
-### 6.3 全局上下文
+### 7.3 全局上下文
 
 **核心文件：** `holmes_operator/context.py`
 
@@ -730,7 +914,7 @@ scheduler_manager: Optional[SchedulerManager]  # 调度器管理器
 4. 初始化 Holmes API 客户端
 5. 启动调度器并加载已有定时任务
 
-### 6.4 事件处理器
+### 7.4 事件处理器
 
 **HealthCheck 处理器** (`handlers/healthcheck.py`)：
 
@@ -760,7 +944,7 @@ scheduler_manager: Optional[SchedulerManager]  # 调度器管理器
 @kopf.on.delete → 从调度器移除定时任务
 ```
 
-### 6.5 调度器
+### 7.5 调度器
 
 **核心文件：** `holmes_operator/scheduler/`
 
@@ -795,7 +979,7 @@ execute_scheduled_check()
     → 超时（600 秒）→ 记录为 ERROR 状态
 ```
 
-### 6.6 API 客户端
+### 7.6 API 客户端
 
 **核心文件：** `holmes_operator/client/holmes_api_client.py`
 
@@ -813,7 +997,7 @@ class HolmesAPIClient:
 - 连接池：`max_keepalive_connections=10`，`max_connections=20`
 - 连接超时：10 秒，总超时：可配置（默认 300 秒）
 
-### 6.7 工具函数
+### 7.7 工具函数
 
 **核心文件：** `holmes_operator/utils.py`
 
@@ -822,7 +1006,7 @@ class HolmesAPIClient:
 `set_healthcheck_pending/running/completed/failed()`：状态快捷设置函数
 `get_current_time_iso()`：获取当前 UTC 时间的 ISO 格式
 
-### 6.8 配置
+### 7.8 配置
 
 **核心文件：** `holmes_operator/config.py`
 
@@ -839,7 +1023,7 @@ class HolmesAPIClient:
 
 ---
 
-## 7. 两者关系与通信
+## 8. 两者关系与通信
 
 ### 数据流
 
@@ -871,7 +1055,7 @@ Operator 设置 Completed/Failed 状态 + 条件
 
 ---
 
-## 8. 开发指南
+## 9. 开发指南
 
 ### 新增一个 Python 工具集
 
