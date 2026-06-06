@@ -90,7 +90,7 @@ HolmesGPT 本质上是一个 **连接了可观测性工具的 AI 代理**。用�
 ## 3. 系统架构图
 
 ```mermaid
-graph TB
+graph LR
     subgraph "用户接口层"
         CLI["CLI (Typer)\nholmes ask/investigate"]
         INTERACTIVE["交互模式\nprompt_toolkit"]
