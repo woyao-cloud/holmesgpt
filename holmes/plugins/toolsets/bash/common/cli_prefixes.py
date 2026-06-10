@@ -50,7 +50,7 @@ def load_cli_bash_tools_approved_prefixes() -> List[str]:
     prefixes_file = os.path.join(config_path_dir, "bash_approved_prefixes.yaml")
     if os.path.exists(prefixes_file):
         try:
-            with open(prefixes_file, "r") as f:
+            with open(prefixes_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
                 if isinstance(data, dict) and "approved_prefixes" in data:
                     return data["approved_prefixes"]
@@ -73,7 +73,7 @@ def save_cli_bash_tools_approved_prefixes(prefixes: List[str]) -> None:
     existing: set[str] = set()
     if os.path.exists(prefixes_file):
         try:
-            with open(prefixes_file, "r") as f:
+            with open(prefixes_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
                 if isinstance(data, dict) and "approved_prefixes" in data:
                     existing = set(data["approved_prefixes"])
@@ -83,7 +83,7 @@ def save_cli_bash_tools_approved_prefixes(prefixes: List[str]) -> None:
     updated = sorted(set(prefixes) | existing)
 
     try:
-        with open(prefixes_file, "w") as f:
+        with open(prefixes_file, "w", encoding="utf-8") as f:
             yaml.safe_dump({"approved_prefixes": updated}, f, default_flow_style=False)
     except Exception as e:
         logging.error(f"Failed to save approved prefixes: {e}")

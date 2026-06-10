@@ -76,7 +76,7 @@ def load_toolsets_from_file(
     toolsets_path: str, strict_check: bool = True
 ) -> List[Toolset]:
     toolsets = []
-    with open(toolsets_path) as file:
+    with open(toolsets_path, encoding="utf-8") as file:
         parsed_yaml = yaml.safe_load(file)
         if parsed_yaml is None:
             raise ValueError(

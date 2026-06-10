@@ -435,7 +435,7 @@ class DiskTokenStore(TokenStore):
         if not self._path.exists():
             return {}
         try:
-            with open(self._path) as f:
+            with open(self._path, encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}

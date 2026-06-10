@@ -34,10 +34,19 @@ curl -sSL https://install.python-poetry.org | python3 -
 # Windows (PowerShell)
 (Invoke-WebRequest -Uri https://install.python-poetry.org -UseBasicParsing).Content | python -
 
+# 增加到Path 
+Win+R → 输入 sysdm.cpl → 回车
+高级 → 环境变量
+用户变量 → 编辑 Path → 新建
+%APPDATA%\pypoetry\venv\Scripts
 # 验证
 poetry --version
 ```
-
+国内加速
+```bash
+poetry config repositories.tuna https://pypi.tuna.tsinghua.edu.cn/simple
+poetry config virtualenvs.in-project true
+```
 ### 必要的 API Key
 
 至少需要以下之一：
@@ -62,6 +71,8 @@ cd holmesgpt
 # 安装所有依赖（含 dev 和 otel 可选组）
 poetry install --with dev,otel
 
+# 安装shell
+poetry self add poetry-plugin-shell
 # 激活虚拟环境
 poetry shell
 ```
