@@ -304,8 +304,13 @@ config.create_toolcalling_llm(
 ```bash
 # -v 一次显示 INFO 级别日志
 # -v -v 两次显示 DEBUG 级别日志
-poetry run holmes ask "..." --verbose --verbose
+poetry run holmes ask "hello" --verbose
 ```
+ export OPENAI_API_BASE="https://code.newcli.com/codex/v1"
+#  olloma
+    export OPENAI_API_BASE="http://localhost:11434/v1"
+    export OPENAI_API_KEY="dummy-key"  # Required but can be any value
+    holmes ask "what pods are failing?" --model="openai/<your-ollama-model>"
 
 #### 使用 OpenRouter 降低调试成本
 
